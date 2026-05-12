@@ -25,8 +25,16 @@ import argparse
 import configparser
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 from dataclasses import dataclass, asdict
+
+LOCAL_TZ = ZoneInfo("Asia/Manila")
+
+
+def now_local() -> datetime:
+    """Current time in the bot's local (Philippine) timezone."""
+    return datetime.now(LOCAL_TZ)
 
 try:
     import requests
@@ -49,18 +57,37 @@ DATA_BASE = "https://data.alpaca.markets"
 
 
 # ----- Logging -----
+class _LocalTzFormatter(logging.Formatter):
+    """Formatter that renders timestamps in LOCAL_TZ (Asia/Manila)."""
+
+    def converter(self, timestamp):  # type: ignore[override]
+        return datetime.fromtimestamp(timestamp, tz=LOCAL_TZ).timetuple()
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=LOCAL_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(timespec="seconds")
+
+
 def setup_logging(verbose: bool = False):
     CONFIG_DIR.mkdir(exist_ok=True)
     level = logging.DEBUG if verbose else logging.INFO
-    fmt = "%(asctime)s [%(levelname)s] %(message)s"
-    logging.basicConfig(
-        level=level,
-        format=fmt,
-        handlers=[
-            logging.FileHandler(LOG_FILE),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    formatter = _LocalTzFormatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Reset handlers so reconfiguration in tests / repeated calls is clean.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
 
 
 # ----- Credentials -----
@@ -97,6 +124,15 @@ def market_is_open(creds) -> tuple[bool, dict]:
     clock = r.json()
     return clock["is_open"], clock
 
+def _format_clock_ts_local(ts: str) -> str:
+    """Render an Alpaca clock timestamp (with timezone offset) in Asia/Manila."""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone(LOCAL_TZ).isoformat(timespec="seconds")
+    except Exception:
+        return ts
+
+
 def sleep_until_next_open(clock: dict, buffer_seconds: int = 60, max_sleep_seconds: int = 3600):
     """
     If the market is closed, sleep until near Alpaca's next_open.
@@ -123,7 +159,7 @@ def sleep_until_next_open(clock: dict, buffer_seconds: int = 60, max_sleep_secon
 
         logging.info(
             f"Market closed. Sleeping {sleep_for} seconds before recheck. "
-            f"Next open: {next_open}"
+            f"Next open: {_format_clock_ts_local(next_open)}"
         )
 
         time.sleep(sleep_for)
@@ -302,6 +338,53 @@ def get_account(creds) -> dict:
     return r.json()
 
 
+def get_open_orders(creds) -> list:
+    """Return list of open (working) orders from Alpaca."""
+    try:
+        r = requests.get(
+            f"{base_url(creds['env'])}/v2/orders",
+            headers=headers(creds),
+            params={"status": "open", "limit": 500, "nested": "true"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            logging.warning(f"Open orders fetch failed: {r.status_code} {r.text[:200]}")
+            return []
+        return r.json() or []
+    except Exception as e:
+        logging.warning(f"Open orders fetch error: {e}")
+        return []
+
+
+def has_open_order(creds, symbol: str, side: Optional[str] = None) -> bool:
+    """Return True if there is at least one open order for `symbol`, optionally filtered by side."""
+    symbol_u = symbol.upper()
+    for o in get_open_orders(creds):
+        if (o.get("symbol") or "").upper() != symbol_u:
+            continue
+        if side is not None and (o.get("side") or "").lower() != side.lower():
+            continue
+        return True
+    return False
+
+
+def get_order(creds, order_id: str) -> Optional[dict]:
+    """Fetch a single order by id; returns None on failure."""
+    if not order_id:
+        return None
+    try:
+        r = requests.get(
+            f"{base_url(creds['env'])}/v2/orders/{order_id}",
+            headers=headers(creds), timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        logging.warning(f"get_order({order_id}) error: {e}")
+        return None
+
+
 def place_order(creds, symbol: str, qty: int, side: str, order_type: str = "market", **kw):
     payload = {
         "symbol": symbol,
@@ -375,7 +458,7 @@ def today_entry_count() -> int:
     if not JOURNAL_FILE.exists():
         return 0
 
-    today = datetime.now().date()
+    today = now_local().date()
     count = 0
 
     try:
@@ -386,7 +469,11 @@ def today_entry_count() -> int:
 
                 ts = row.get("timestamp", "")
                 try:
-                    if datetime.fromisoformat(ts).date() == today:
+                    parsed = datetime.fromisoformat(ts)
+                    # Compare in Asia/Manila so "today" matches log timestamps.
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone(LOCAL_TZ)
+                    if parsed.date() == today:
                         count += 1
                 except ValueError:
                     continue
@@ -409,6 +496,21 @@ def minutes_until_market_close(clock: dict) -> Optional[float]:
     except Exception as e:
         logging.warning(f"Could not parse next_close={next_close}: {e}")
         return None
+
+
+def is_force_close_window(clock: dict, minutes: int) -> bool:
+    """
+    True when the market is open and minutes until regular close is <= `minutes`.
+    Used to force-close positions and block new entries late in the session.
+    """
+    if minutes <= 0:
+        return False
+    if not clock.get("is_open"):
+        return False
+    mins = minutes_until_market_close(clock)
+    if mins is None:
+        return False
+    return mins <= minutes
 
 
 def build_entry_block_reasons(
@@ -458,6 +560,28 @@ def build_entry_block_reasons(
 
 
 # ----- Journal -----
+EXIT_ACTIONS = {
+    "tp": ("EXIT_TP", "EXIT_TP_SUBMITTED"),
+    "sl": ("EXIT_SL", "EXIT_SL_SUBMITTED"),
+    "signal": ("EXIT_SIGNAL", "EXIT_SIGNAL_SUBMITTED"),
+    "force": ("EXIT_FORCE_CLOSE", "EXIT_FORCE_CLOSE_SUBMITTED"),
+}
+
+
+def _exit_action_from_order(kind: str, order: Optional[dict]) -> tuple[str, str]:
+    """
+    Map a placed exit order's status to (journal_action, status_str).
+    If order is None we treat as failed-to-submit so the caller can log clearly.
+    """
+    filled_action, submitted_action = EXIT_ACTIONS[kind]
+    if not order:
+        return (submitted_action, "submit_failed")
+    status = (order.get("status") or "").lower()
+    if status == "filled":
+        return (filled_action, status)
+    return (submitted_action, status or "unknown")
+
+
 def journal_write(row: dict):
     new_file = not JOURNAL_FILE.exists()
     with open(JOURNAL_FILE, "a", newline="") as f:
@@ -485,11 +609,55 @@ def save_state(state: dict):
 
 
 # ----- Main loop -----
+def _submit_exit(creds, symbol: str, qty: int, kind: str, base_reason: str,
+                 price, dry_run: bool):
+    """
+    Submit an exit (sell) order and write the result to the journal.
+
+    Skips submission if there is already an open sell order for `symbol`.
+    Records EXIT_* only when the broker actually filled the order; otherwise
+    records EXIT_*_SUBMITTED with the returned status in the reason.
+    """
+    if dry_run:
+        filled_action, _ = EXIT_ACTIONS[kind]
+        journal_write({
+            "timestamp": now_local().isoformat(timespec="seconds"),
+            "action": filled_action + "_DRY", "symbol": symbol, "qty": qty,
+            "price": price, "reason": base_reason, "dry_run": True,
+        })
+        return
+
+    if has_open_order(creds, symbol, side="sell"):
+        logging.info(f"SKIP exit {symbol}: open sell order already exists")
+        journal_write({
+            "timestamp": now_local().isoformat(timespec="seconds"),
+            "action": "EXIT_SKIPPED_OPEN_ORDER", "symbol": symbol, "qty": qty,
+            "price": price,
+            "reason": f"{base_reason} | open sell order already exists",
+            "dry_run": False,
+        })
+        return
+
+    order = place_order(creds, symbol, qty, "sell")
+    action, status = _exit_action_from_order(kind, order)
+    reason = base_reason
+    if not order or status != "filled":
+        reason = f"{base_reason} | order_status={status}"
+
+    journal_write({
+        "timestamp": now_local().isoformat(timespec="seconds"),
+        "action": action, "symbol": symbol, "qty": qty,
+        "price": price, "reason": reason,
+        "order_id": order["id"] if order else "", "dry_run": False,
+    })
+
+
 def run_cycle(creds, watchlist: list[str], strategy_name: str,
               dry_run: bool, max_per_trade: float, take_profit_pct: float,
               stop_loss_pct: float, max_open_positions: int,
               max_total_exposure: float, max_daily_trades: int,
-              max_daily_loss: float, no_new_trades_minutes_before_close: int):
+              max_daily_loss: float, no_new_trades_minutes_before_close: int,
+              force_close_minutes_before_close: int):
     """One full pass: check market, fetch signals, manage positions, place new entries."""
     strategy = STRATEGIES[strategy_name]
     state = load_state()
@@ -498,7 +666,7 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
     is_open, clock = market_is_open(creds)
     if not is_open:
         next_open = clock.get("next_open", "")
-        logging.info(f"Market closed. Next open: {next_open}")
+        logging.info(f"Market closed. Next open: {_format_clock_ts_local(next_open)}")
         return
 
     account = get_account(creds)
@@ -506,41 +674,39 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
     positions = get_positions(creds)
     logging.info(f"Equity ${equity:,.2f} | {len(positions)} open positions | strategy={strategy_name}")
 
-    # Step 1: manage existing positions — check for take-profit / stop-loss
+    force_close = is_force_close_window(clock, force_close_minutes_before_close)
+    if force_close:
+        mins = minutes_until_market_close(clock)
+        mins_str = f"{mins:.1f}m" if mins is not None else "?"
+        logging.info(
+            f"force close window active "
+            f"({mins_str} <= {force_close_minutes_before_close}m to close)"
+        )
+
+    # Step 1: manage existing positions — check for take-profit / stop-loss / force-close
     for symbol, pos in positions.items():
         # Skip option positions — bot trades equities only here
         if not is_equity_symbol(symbol):
             continue
         pnl_pct = float(pos["unrealized_plpc"]) * 100
         qty = abs(int(float(pos["qty"])))
+        price = pos.get("current_price", 0)
 
-        if pnl_pct >= take_profit_pct:
+        if force_close:
+            reason = (
+                f"force close window ({pnl_pct:+.2f}% pnl, "
+                f"<= {force_close_minutes_before_close}m to close)"
+            )
+            logging.info(f"EXIT {symbol}: {reason}")
+            _submit_exit(creds, symbol, qty, "force", reason, price, dry_run)
+        elif pnl_pct >= take_profit_pct:
             reason = f"take-profit hit ({pnl_pct:+.2f}% >= {take_profit_pct}%)"
             logging.info(f"EXIT {symbol}: {reason}")
-            if not dry_run:
-                order = place_order(creds, symbol, qty, "sell")
-                journal_write({
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "action": "EXIT_TP", "symbol": symbol, "qty": qty,
-                    "price": pos["current_price"], "reason": reason,
-                    "order_id": order["id"] if order else "", "dry_run": False,
-                })
-            else:
-                journal_write({"timestamp": datetime.now().isoformat(timespec="seconds"),
-                               "action": "EXIT_TP_DRY", "symbol": symbol, "qty": qty,
-                               "price": pos["current_price"], "reason": reason, "dry_run": True})
-
+            _submit_exit(creds, symbol, qty, "tp", reason, price, dry_run)
         elif pnl_pct <= -stop_loss_pct:
             reason = f"stop-loss hit ({pnl_pct:+.2f}% <= -{stop_loss_pct}%)"
             logging.info(f"EXIT {symbol}: {reason}")
-            if not dry_run:
-                order = place_order(creds, symbol, qty, "sell")
-                journal_write({
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "action": "EXIT_SL", "symbol": symbol, "qty": qty,
-                    "price": pos["current_price"], "reason": reason,
-                    "order_id": order["id"] if order else "", "dry_run": False,
-                })
+            _submit_exit(creds, symbol, qty, "sl", reason, price, dry_run)
 
     # Re-fetch positions in case we just exited
     if not dry_run:
@@ -551,6 +717,9 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
         max_open_positions, max_total_exposure, max_daily_trades,
         max_daily_loss, no_new_trades_minutes_before_close,
     )
+
+    if force_close:
+        entry_block_reasons = list(entry_block_reasons) + ["force close window active"]
 
     if entry_block_reasons:
         logging.info("New entries blocked: " + "; ".join(entry_block_reasons))
@@ -572,7 +741,9 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
         if cooldown_until:
             try:
                 until = datetime.fromisoformat(cooldown_until)
-                if datetime.now() < until:
+                # Compare in the same wall-clock zone we wrote them in.
+                now_cmp = now_local() if until.tzinfo else datetime.now()
+                if now_cmp < until:
                     table.add_row(symbol, "—", "[dim]cooldown[/dim]",
                                   f"until {until.strftime('%H:%M')}")
                     continue
@@ -610,9 +781,22 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
                 logging.warning(f"{symbol}: sizing returned 0 qty, skipping")
                 continue
 
+            # Avoid submitting a buy when there is already an open order for this symbol.
+            if not dry_run and has_open_order(creds, symbol):
+                logging.info(f"SKIP {symbol}: open order already exists for symbol")
+                journal_write({
+                    "timestamp": now_local().isoformat(timespec="seconds"),
+                    "action": "ENTER_SKIPPED_OPEN_ORDER", "symbol": symbol, "qty": qty,
+                    "price": sig.price,
+                    "reason": f"{sig.reason} | open order already exists",
+                    "rsi": sig.rsi_val, "sma_fast": sig.sma_fast, "sma_slow": sig.sma_slow,
+                    "vol_z": sig.vol_z, "dry_run": False,
+                })
+                continue
+
             logging.info(f"ENTER {symbol}: BUY {qty} @ ~${sig.price:.2f} — {sig.reason}")
             row = {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "timestamp": now_local().isoformat(timespec="seconds"),
                 "action": "ENTER" if not dry_run else "ENTER_DRY",
                 "symbol": symbol, "qty": qty, "price": sig.price, "reason": sig.reason,
                 "rsi": sig.rsi_val, "sma_fast": sig.sma_fast, "sma_slow": sig.sma_slow,
@@ -622,7 +806,7 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
             if not dry_run:
                 order = place_order(creds, symbol, qty, "buy")
                 row["order_id"] = order["id"] if order else ""
-                cooldowns[symbol] = (datetime.now() + timedelta(hours=1)).isoformat()
+                cooldowns[symbol] = (now_local() + timedelta(hours=1)).isoformat()
 
             journal_write(row)
 
@@ -637,17 +821,12 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
                 max_open_positions, max_total_exposure, max_daily_trades,
                 max_daily_loss, no_new_trades_minutes_before_close,
             )
+            if force_close:
+                entry_block_reasons = list(entry_block_reasons) + ["force close window active"]
         elif sig.action == "sell" and symbol in positions:
             qty = abs(int(float(positions[symbol]["qty"])))
             logging.info(f"EXIT {symbol}: signal sell")
-            if not dry_run:
-                order = place_order(creds, symbol, qty, "sell")
-                journal_write({
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "action": "EXIT_SIGNAL", "symbol": symbol, "qty": qty,
-                    "price": sig.price, "reason": sig.reason,
-                    "order_id": order["id"] if order else "", "dry_run": False,
-                })
+            _submit_exit(creds, symbol, qty, "signal", sig.reason, sig.price, dry_run)
 
     console.print(table)
     state["cooldowns"] = cooldowns
@@ -697,6 +876,9 @@ Examples:
                    help="Block new entries if daily account P&L is <= -N%% (default 1.0)")
     p.add_argument("--no-new-trades-minutes-before-close", type=int, default=30,
                    help="Block new entries this many minutes before market close (default 30)")
+    p.add_argument("--force-close-minutes-before-close", type=int, default=10,
+                   help="Force close existing equity positions this many minutes before "
+                        "market close, and block new entries (default 10)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -723,7 +905,8 @@ Examples:
                       args.max_per_trade, args.take_profit, args.stop_loss,
                       args.max_open_positions, args.max_total_exposure,
                       args.max_daily_trades, args.max_daily_loss,
-                      args.no_new_trades_minutes_before_close)
+                      args.no_new_trades_minutes_before_close,
+                      args.force_close_minutes_before_close)
         except Exception as e:
             logging.exception(f"Cycle failed: {e}")
         return
@@ -732,14 +915,14 @@ Examples:
     cycle = 0
     while True:
         cycle += 1
-        console.print(f"\n[dim]── Cycle {cycle} @ {datetime.now().strftime('%H:%M:%S')} ──[/dim]")
+        console.print(f"\n[dim]── Cycle {cycle} @ {now_local().strftime('%Y-%m-%d %H:%M:%S %Z')} ──[/dim]")
 
         try:
             is_open, clock = market_is_open(creds)
 
             if not is_open:
                 next_open = clock.get("next_open", "")
-                logging.info(f"Market closed. Next open: {next_open}")
+                logging.info(f"Market closed. Next open: {_format_clock_ts_local(next_open)}")
                 sleep_until_next_open(clock)
                 continue
 
@@ -747,7 +930,8 @@ Examples:
                       args.max_per_trade, args.take_profit, args.stop_loss,
                       args.max_open_positions, args.max_total_exposure,
                       args.max_daily_trades, args.max_daily_loss,
-                      args.no_new_trades_minutes_before_close)
+                      args.no_new_trades_minutes_before_close,
+                      args.force_close_minutes_before_close)
 
             time.sleep(args.interval)
 
