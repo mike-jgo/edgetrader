@@ -14,10 +14,17 @@ This project is trading software. Use paper trading first. Live mode can place r
 |-- edgetrader.py       # Main CLI for manual trading workflows
 |-- edgetrader_bot.py   # Scheduled strategy bot
 |-- install.sh          # Bash installer for the edgetrader CLI only
+|-- requirements.txt    # Pinned Python dependencies
 |-- README.md           # Project overview
+|-- .github/workflows/
+|   `-- ci.yml          # Tests on every push/PR; deploys main to the homelab
+|-- deploy/             # systemd unit, bot.env example, container setup script
+|-- tests/
+|   `-- test_bot.py     # Bot order-safety tests (python -m unittest discover -s tests)
 `-- docs/
     |-- CLI_README.md   # Manual CLI usage
-    `-- BOT_README.md   # Bot usage and risk controls
+    |-- BOT_README.md   # Bot usage and risk controls
+    `-- DEPLOY.md       # Homelab deployment and CI/CD
 ```
 
 ## Requirements
