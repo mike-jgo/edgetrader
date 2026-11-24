@@ -32,6 +32,7 @@ from typing import Optional
 from dataclasses import dataclass, asdict
 
 LOCAL_TZ = ZoneInfo("Asia/Manila")
+MARKET_TZ = ZoneInfo("America/New_York")  # trading days follow the US session, not Manila midnight
 
 
 def now_local() -> datetime:
@@ -58,7 +59,8 @@ STATE_FILE = CONFIG_DIR / "bot_state.json"
 DATA_BASE = "https://data.alpaca.markets"
 
 CLIENT_ORDER_PREFIX = "etbot-"
-IEX_DELAY = timedelta(minutes=16)       # request bars ending this long ago
+BAR_TIMEFRAME = "5Min"
+BAR_SIZE = timedelta(minutes=5)         # must match BAR_TIMEFRAME
 MAX_BAR_AGE = timedelta(minutes=15)     # newest bar older than this (3 x 5Min) is stale
 UNCERTAIN_ORDER_GRACE = timedelta(minutes=2)  # wait before deciding an uncertain order never arrived
 TERMINAL_ORDER_STATUSES = {"filled", "canceled", "expired", "rejected", "replaced", "done_for_day"}
@@ -191,16 +193,17 @@ def _parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-def fetch_bars(creds, symbol: str, timeframe: str = "5Min", limit: int = 100):
+def fetch_bars(creds, symbol: str, limit: int = 100):
     """
-    Fetch the most recent bars. Returns list of {t, o, h, l, c, v} dicts (oldest first).
+    Fetch the most recent completed bars. Returns list of {t, o, h, l, c, v} dicts (oldest first).
+    The IEX feed is real-time, so bars are requested up to now and the bar still forming is dropped.
     Returns [] when the request fails or the newest bar is older than MAX_BAR_AGE,
     so signals are never computed from stale data.
     """
-    end = datetime.now(timezone.utc) - IEX_DELAY
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=5)
     params = {
-        "timeframe": timeframe,
+        "timeframe": BAR_TIMEFRAME,
         "start": start.isoformat().replace("+00:00", "Z"),
         "end": end.isoformat().replace("+00:00", "Z"),
         "limit": limit,
@@ -221,6 +224,7 @@ def fetch_bars(creds, symbol: str, timeframe: str = "5Min", limit: int = 100):
         return []
     try:
         bars = sorted(r.json().get("bars") or [], key=lambda b: _parse_ts(b["t"]))
+        bars = [b for b in bars if _parse_ts(b["t"]) + BAR_SIZE <= end]  # drop the forming bar
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         logging.warning(f"Bars for {symbol} could not be read: {e}")
         return []
@@ -566,7 +570,8 @@ def today_entry_count(include_dry: bool) -> int:
         return 0
 
     actions = {"ENTER", "ENTER_UNCERTAIN"} | ({"ENTER_DRY"} if include_dry else set())
-    today = now_local().date()
+    # "Today" is the New York trading date: the session crosses midnight in Manila.
+    today = now_local().astimezone(MARKET_TZ).date()
     count = 0
 
     with open(JOURNAL_FILE, newline="") as f:
@@ -577,10 +582,9 @@ def today_entry_count(include_dry: bool) -> int:
             ts = row.get("timestamp", "")
             try:
                 parsed = datetime.fromisoformat(ts)
-                # Compare in Asia/Manila so "today" matches log timestamps.
-                if parsed.tzinfo is not None:
-                    parsed = parsed.astimezone(LOCAL_TZ)
-                if parsed.date() == today:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=LOCAL_TZ)  # journal rows are written in Manila time
+                if parsed.astimezone(MARKET_TZ).date() == today:
                     count += 1
             except ValueError:
                 continue

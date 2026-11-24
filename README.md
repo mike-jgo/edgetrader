@@ -158,7 +158,7 @@ Both scripts use direct HTTP requests against Alpaca APIs with shared helper fun
 
 `edgetrader.py` is command-driven. It builds an `argparse` CLI, maps each subcommand to a handler, calls Alpaca account/trading/data endpoints, and renders terminal tables with Rich.
 
-`edgetrader_bot.py` is loop-driven. Each cycle checks whether the market is open, fetches delayed IEX bars, computes rule-based signals, manages existing positions using stop-loss and take-profit rules, applies entry risk limits, optionally places orders, and writes logs/journal files.
+`edgetrader_bot.py` is loop-driven. Each cycle checks whether the market is open, fetches real-time IEX bars, computes rule-based signals, manages existing positions using stop-loss and take-profit rules, applies entry risk limits, optionally places orders, and writes logs/journal files.
 
 ## Runtime Files
 

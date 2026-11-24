@@ -34,8 +34,8 @@ class FakeResponse:
 
 
 def make_bars(direction: str, n: int = 60, newest_age_minutes: int = 0):
-    """5-minute bars ending at the bot's request end. 'down' gives an RSI buy, 'up' an RSI sell."""
-    end = datetime.now(timezone.utc) - bot.IEX_DELAY - timedelta(minutes=newest_age_minutes)
+    """Completed 5-minute bars ending now. 'down' gives an RSI buy, 'up' an RSI sell."""
+    end = datetime.now(timezone.utc) - timedelta(minutes=newest_age_minutes)
     bars = []
     for i in range(n):
         t = end - timedelta(minutes=5 * (n - i))
@@ -252,6 +252,19 @@ class MarketData(BotTestCase):
         self.assertEqual(self.broker.bar_params[0]["sort"], "desc")
         self.assertEqual(got, bars)
 
+    def test_requests_bars_up_to_now(self):
+        self.broker.bars["AAA"] = make_bars("down")
+        bot.fetch_bars(CREDS, "AAA")
+        end = datetime.fromisoformat(self.broker.bar_params[0]["end"].replace("Z", "+00:00"))
+        self.assertLess(datetime.now(timezone.utc) - end, timedelta(minutes=1))
+
+    def test_forming_bar_is_dropped(self):
+        bars = make_bars("down")
+        forming = dict(bars[-1], t=(datetime.now(timezone.utc) - timedelta(minutes=2))
+                       .isoformat().replace("+00:00", "Z"))
+        self.broker.bars["AAA"] = bars + [forming]
+        self.assertEqual(bot.fetch_bars(CREDS, "AAA"), bars)
+
     def test_stale_bars_are_rejected(self):
         self.broker.bars["AAA"] = make_bars("down", newest_age_minutes=60)
         self.assertEqual(bot.fetch_bars(CREDS, "AAA"), [])
@@ -259,6 +272,17 @@ class MarketData(BotTestCase):
     def test_network_error_returns_no_bars(self):
         with mock.patch.object(bot.requests, "get", side_effect=requests.ConnectionError("down")):
             self.assertEqual(bot.fetch_bars(CREDS, "AAA"), [])
+
+
+class DailyTradeCount(BotTestCase):
+    def test_count_follows_new_york_trading_date(self):
+        # 01:00 Manila on Nov 25 is 12:00 New York on Nov 24, mid-session.
+        now = datetime(2026, 11, 25, 1, 0, tzinfo=bot.LOCAL_TZ)
+        for ts in ("2026-11-24T23:00:00+08:00",   # 10:00 NY Nov 24: same session
+                   "2026-11-24T08:00:00+08:00"):  # 19:00 NY Nov 23: previous session
+            bot.journal_write({"timestamp": ts, "action": "ENTER", "symbol": "AAA"})
+        with mock.patch.object(bot, "now_local", return_value=now):
+            self.assertEqual(bot.today_entry_count(include_dry=False), 1)
 
 
 class Ownership(BotTestCase):

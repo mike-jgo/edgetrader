@@ -168,7 +168,7 @@ Blocks a new entry when gross equity exposure in the account, plus pending bot b
 --max-daily-trades 3
 ```
 
-Blocks new entries after this many entries for the current date. A live run counts `ENTER` and `ENTER_UNCERTAIN` journal rows; a dry run also counts `ENTER_DRY`. Rejected orders don't count. If the journal can't be read, new entries are blocked.
+Blocks new entries after this many entries for the current New York trading date, so the count doesn't reset at midnight Manila time in the middle of the session. A live run counts `ENTER` and `ENTER_UNCERTAIN` journal rows; a dry run also counts `ENTER_DRY`. Rejected orders don't count. If the journal can't be read, new entries are blocked.
 
 ### Maximum Daily Loss
 
@@ -273,9 +273,9 @@ It requests:
 - feed: `iex`
 - adjustment: `raw`
 - a recent five-day window, newest bars first (`sort=desc`), so the 100-bar limit keeps the latest bars
-- an end timestamp buffered by 16 minutes for delayed IEX data
+- an end timestamp of now, since the IEX feed is real-time on Alpaca's free plan
 
-Bars are sorted oldest first before indicators are computed. If the newest bar starts more than 15 minutes before the end timestamp, the symbol is skipped for that cycle. This also skips the first few minutes after the open, while the newest bars are still from the previous session.
+Bars are sorted oldest first before indicators are computed, and the bar that is still forming is dropped, so signals use completed bars only. If the newest completed bar starts more than 15 minutes before now, the symbol is skipped for that cycle. This also skips the first few minutes after the open, while the newest bars are still from the previous session.
 
 ## Symbol Scope
 
