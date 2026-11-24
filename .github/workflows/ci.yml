@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile edgetrader.py edgetrader_bot.py
+      - run: python -m unittest discover -s tests -v
+
+  # Runs on the homelab runner. Only pushes to main in this repository get here,
+  # never pull requests, so fork code can't reach the box that holds the Alpaca keys.
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'mike-jgo/edgetrader'
+    runs-on: [self-hosted, edgetrader]
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          set -eu
+          /srv/edgetrader/venv/bin/pip install --quiet -r requirements.txt
+      - name: Publish release
+        run: |
+          set -eu
+          release=/srv/edgetrader/releases/${GITHUB_SHA}
+          rm -rf "$release"
+          mkdir -p "$release"
+          cp edgetrader_bot.py edgetrader.py requirements.txt "$release/"
+          /srv/edgetrader/venv/bin/python -m py_compile "$release/edgetrader_bot.py"
+          /srv/edgetrader/venv/bin/python "$release/edgetrader_bot.py" --help > /dev/null
+          ln -sfn "$release" /srv/edgetrader/current.tmp
+          mv -T /srv/edgetrader/current.tmp /srv/edgetrader/current
+          ls -1dt /srv/edgetrader/releases/* | tail -n +6 | xargs -r rm -rf
+      - name: Restart bot
+        run: sudo /usr/bin/systemctl restart edgetrader-bot
+      - name: Check bot is running
+        run: |
+          sleep 20
+          systemctl is-active --quiet edgetrader-bot || {
+            journalctl -u edgetrader-bot -n 50 --no-pager
+            exit 1
+          }

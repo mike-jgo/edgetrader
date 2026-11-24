@@ -1,0 +1,27 @@
+[Unit]
+Description=EdgeTrader bot (Alpaca paper)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=edgetrader
+Group=edgetrader
+# State, journal, log and config.ini live in ~edgetrader/.edgetrader, outside the releases.
+EnvironmentFile=/etc/edgetrader/bot.env
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/srv/edgetrader/current
+# --env paper is fixed here on purpose. Live mode asks for a typed confirmation,
+# which a service can't give, so it would fail to start rather than trade.
+ExecStart=/srv/edgetrader/venv/bin/python /srv/edgetrader/current/edgetrader_bot.py --env paper $BOT_ARGS
+Restart=on-failure
+RestartSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/edgetrader
+
+[Install]
+WantedBy=multi-user.target
