@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EdgeTrader Bot — scheduled paper trader using rule-based signals.
+EdgeTrader Bot - scheduled paper trader using rule-based signals.
 
 Runs a strategy loop on a schedule:
   - Pulls bars from Alpaca
@@ -23,6 +23,8 @@ import json
 import logging
 import argparse
 import configparser
+import uuid
+from decimal import Decimal
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -54,6 +56,22 @@ JOURNAL_FILE = CONFIG_DIR / "journal.csv"
 STATE_FILE = CONFIG_DIR / "bot_state.json"
 
 DATA_BASE = "https://data.alpaca.markets"
+
+CLIENT_ORDER_PREFIX = "etbot-"
+IEX_DELAY = timedelta(minutes=16)       # request bars ending this long ago
+MAX_BAR_AGE = timedelta(minutes=15)     # newest bar older than this (3 x 5Min) is stale
+UNCERTAIN_ORDER_GRACE = timedelta(minutes=2)  # wait before deciding an uncertain order never arrived
+TERMINAL_ORDER_STATUSES = {"filled", "canceled", "expired", "rejected", "replaced", "done_for_day"}
+
+JOURNAL_FIELDS = [
+    "timestamp", "action", "symbol", "qty", "signal_price", "fill_price",
+    "order_status", "reason", "rsi", "sma_fast", "sma_slow", "vol_z",
+    "order_id", "dry_run",
+]
+OLD_JOURNAL_FIELDS = [
+    "timestamp", "action", "symbol", "qty", "price", "reason",
+    "rsi", "sma_fast", "sma_slow", "vol_z", "order_id", "dry_run",
+]
 
 
 # ----- Logging -----
@@ -169,26 +187,50 @@ def sleep_until_next_open(clock: dict, buffer_seconds: int = 60, max_sleep_secon
         time.sleep(300)
 
 # ----- Bars + indicators -----
+def _parse_ts(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
 def fetch_bars(creds, symbol: str, timeframe: str = "5Min", limit: int = 100):
-    """Fetch recent bars. Returns list of {t, o, h, l, c, v} dicts (oldest first)."""
-    end = datetime.now(timezone.utc) - timedelta(minutes=16)  # IEX 15-min delay buffer
+    """
+    Fetch the most recent bars. Returns list of {t, o, h, l, c, v} dicts (oldest first).
+    Returns [] when the request fails or the newest bar is older than MAX_BAR_AGE,
+    so signals are never computed from stale data.
+    """
+    end = datetime.now(timezone.utc) - IEX_DELAY
     start = end - timedelta(days=5)
     params = {
         "timeframe": timeframe,
         "start": start.isoformat().replace("+00:00", "Z"),
         "end": end.isoformat().replace("+00:00", "Z"),
         "limit": limit,
+        "sort": "desc",  # newest first, so `limit` keeps the latest bars, not the oldest
         "adjustment": "raw",
         "feed": "iex",
     }
-    r = requests.get(
-        f"{DATA_BASE}/v2/stocks/{symbol}/bars",
-        headers=headers(creds), params=params, timeout=15
-    )
+    try:
+        r = requests.get(
+            f"{DATA_BASE}/v2/stocks/{symbol}/bars",
+            headers=headers(creds), params=params, timeout=15
+        )
+    except requests.RequestException as e:
+        logging.warning(f"Bars fetch error for {symbol}: {e}")
+        return []
     if r.status_code != 200:
         logging.warning(f"Bars fetch failed for {symbol}: {r.status_code} {r.text[:200]}")
         return []
-    return r.json().get("bars", [])
+    try:
+        bars = sorted(r.json().get("bars") or [], key=lambda b: _parse_ts(b["t"]))
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        logging.warning(f"Bars for {symbol} could not be read: {e}")
+        return []
+    if not bars:
+        return []
+    newest = _parse_ts(bars[-1]["t"])
+    if end - newest > MAX_BAR_AGE:
+        logging.info(f"Bars for {symbol} are stale (newest starts {newest.isoformat()}), skipping")
+        return []
+    return bars
 
 
 def rsi(closes: list[float], period: int = 14) -> Optional[float]:
@@ -250,7 +292,7 @@ def strategy_rsi_reversion(symbol: str, bars: list) -> Signal:
     """
     Mean reversion: buy when RSI < 30 (oversold) with positive volume confirmation,
     sell when RSI > 70 (overbought).
-    Conservative — only fires on extremes.
+    Conservative - only fires on extremes.
     """
     if len(bars) < 30:
         return Signal(symbol, "hold", 0, "insufficient bars")
@@ -273,7 +315,7 @@ def strategy_rsi_reversion(symbol: str, bars: list) -> Signal:
                           f"RSI={r:.1f} oversold, vol_z={vz:.2f}" if vz is not None
                           else f"RSI={r:.1f} oversold",
                           r, fast, slow, vz)
-        # Oversold but volume hasn't confirmed — hold rather than catch a falling knife
+        # Oversold but volume hasn't confirmed - hold rather than catch a falling knife
         return Signal(symbol, "hold", last,
                       f"RSI={r:.1f} oversold but vol_z={vz:.2f} too low",
                       r, fast, slow, vz)
@@ -325,10 +367,9 @@ STRATEGIES = {
 
 # ----- Position + order helpers -----
 def get_positions(creds) -> dict:
-    """Return {symbol: position_dict}."""
+    """Return {symbol: position_dict}. Raises if the positions can't be read."""
     r = requests.get(f"{base_url(creds['env'])}/v2/positions", headers=headers(creds), timeout=10)
-    if r.status_code != 200:
-        return {}
+    r.raise_for_status()
     return {p["symbol"]: p for p in r.json()}
 
 
@@ -338,34 +379,22 @@ def get_account(creds) -> dict:
     return r.json()
 
 
+OPEN_ORDERS_LIMIT = 500
+
+
 def get_open_orders(creds) -> list:
-    """Return list of open (working) orders from Alpaca."""
-    try:
-        r = requests.get(
-            f"{base_url(creds['env'])}/v2/orders",
-            headers=headers(creds),
-            params={"status": "open", "limit": 500, "nested": "true"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            logging.warning(f"Open orders fetch failed: {r.status_code} {r.text[:200]}")
-            return []
-        return r.json() or []
-    except Exception as e:
-        logging.warning(f"Open orders fetch error: {e}")
-        return []
-
-
-def has_open_order(creds, symbol: str, side: Optional[str] = None) -> bool:
-    """Return True if there is at least one open order for `symbol`, optionally filtered by side."""
-    symbol_u = symbol.upper()
-    for o in get_open_orders(creds):
-        if (o.get("symbol") or "").upper() != symbol_u:
-            continue
-        if side is not None and (o.get("side") or "").lower() != side.lower():
-            continue
-        return True
-    return False
+    """Return list of open (working) orders from Alpaca. Raises if they can't be read in full."""
+    r = requests.get(
+        f"{base_url(creds['env'])}/v2/orders",
+        headers=headers(creds),
+        params={"status": "open", "limit": OPEN_ORDERS_LIMIT, "nested": "true"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    orders = r.json() or []
+    if len(orders) >= OPEN_ORDERS_LIMIT:
+        raise RuntimeError(f"{len(orders)} open orders returned; the list may be incomplete")
+    return orders
 
 
 def get_order(creds, order_id: str) -> Optional[dict]:
@@ -385,26 +414,96 @@ def get_order(creds, order_id: str) -> Optional[dict]:
         return None
 
 
-def place_order(creds, symbol: str, qty: int, side: str, order_type: str = "market", **kw):
+def get_order_by_client_id(creds, client_order_id: str) -> Optional[dict]:
+    """
+    Look up an order by the client_order_id the bot gave it.
+    Returns None if the broker has no such order; raises on any other failure.
+    """
+    r = requests.get(
+        f"{base_url(creds['env'])}/v2/orders:by_client_order_id",
+        headers=headers(creds), params={"client_order_id": client_order_id}, timeout=10,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def place_order(creds, symbol: str, qty, side: str, client_order_id: str,
+                order_type: str = "market", **kw) -> tuple[str, Optional[dict]]:
+    """
+    Submit an order. Returns (outcome, order):
+      "accepted"  - the broker returned the order
+      "rejected"  - the broker refused it (4xx), so nothing was placed
+      "uncertain" - timeout, connection error or 5xx: the order may or may not exist,
+                    so it is reconciled by client_order_id before the bot acts again
+    """
     payload = {
         "symbol": symbol,
         "qty": str(qty),
         "side": side,
         "type": order_type,
         "time_in_force": kw.get("tif", "day"),
+        "client_order_id": client_order_id,
     }
     if "limit_price" in kw:
         payload["limit_price"] = str(kw["limit_price"])
     if "stop_price" in kw:
         payload["stop_price"] = str(kw["stop_price"])
-    r = requests.post(
-        f"{base_url(creds['env'])}/v2/orders",
-        headers=headers(creds), json=payload, timeout=15
-    )
+    try:
+        r = requests.post(
+            f"{base_url(creds['env'])}/v2/orders",
+            headers=headers(creds), json=payload, timeout=15
+        )
+    except requests.RequestException as e:
+        logging.error(
+            f"Order submission uncertain: symbol={symbol} side={side} qty={qty} "
+            f"client_order_id={client_order_id} error={e}"
+        )
+        return "uncertain", None
+    if r.status_code >= 500:
+        logging.error(
+            f"Order submission uncertain: symbol={symbol} side={side} qty={qty} "
+            f"client_order_id={client_order_id} {r.status_code} {r.text[:200]}"
+        )
+        return "uncertain", None
     if r.status_code not in (200, 201):
-        logging.error(f"Order failed: {r.status_code} {r.text}")
-        return None
-    return r.json()
+        logging.error(f"Order rejected: {r.status_code} {r.text}")
+        return "rejected", None
+    try:
+        order = r.json()
+    except ValueError:
+        logging.error(f"Order response unreadable: client_order_id={client_order_id} {r.text[:200]}")
+        return "uncertain", None
+    fill_price = order_fill_price(order)
+    status = order_status(order)
+    order_id = order.get("id", "")
+    if fill_price:
+        logging.info(
+            f"ORDER submitted: symbol={symbol} side={side} qty={qty} "
+            f"status={status or 'unknown'} order_id={order_id} "
+            f"filled_avg_price={fill_price}"
+        )
+    else:
+        logging.info(
+            f"ORDER submitted but not filled yet: symbol={symbol} side={side} qty={qty} "
+            f"status={status or 'unknown'} order_id={order_id} filled_avg_price unavailable"
+        )
+    return "accepted", order
+
+
+def order_fill_price(order: dict) -> str:
+    """Return the broker-reported average fill price when available."""
+    if not order:
+        return ""
+    return str(order.get("filled_avg_price") or "")
+
+
+def order_status(order: dict) -> str:
+    """Return the broker-reported order status when available."""
+    if not order:
+        return ""
+    return str(order.get("status") or "")
 
 
 # ----- Risk + sizing -----
@@ -428,19 +527,24 @@ def equity_positions(positions: dict) -> dict:
     return {s: p for s, p in positions.items() if is_equity_symbol(s)}
 
 
-def total_exposure_pct(positions: dict, equity: float) -> float:
-    """Current gross equity exposure as a percentage of account equity."""
-    if equity <= 0:
-        return 100.0
-
+def exposure_dollars(positions: dict) -> float:
+    """Current gross equity exposure across the account, in dollars."""
     total = 0.0
     for pos in equity_positions(positions).values():
         try:
             total += abs(float(pos.get("market_value", 0)))
         except (TypeError, ValueError):
             continue
+    return total
 
-    return (total / equity) * 100
+
+def entry_usage(positions: dict, pending: dict) -> tuple[int, float]:
+    """
+    Open position count and gross exposure in dollars, counting pending buys
+    ({symbol: reserved dollars}) as if they had already filled.
+    """
+    open_count = len(set(equity_positions(positions)) | set(pending))
+    return open_count, exposure_dollars(positions) + sum(pending.values())
 
 
 def day_pnl_pct(account: dict) -> float:
@@ -453,32 +557,33 @@ def day_pnl_pct(account: dict) -> float:
     return ((equity - last_equity) / last_equity) * 100
 
 
-def today_entry_count() -> int:
-    """Count today's entries from the CSV journal."""
+def today_entry_count(include_dry: bool) -> int:
+    """
+    Count today's entries from the CSV journal: submitted and uncertain orders,
+    plus dry-run entries when `include_dry`. Raises if the journal can't be read.
+    """
     if not JOURNAL_FILE.exists():
         return 0
 
+    actions = {"ENTER", "ENTER_UNCERTAIN"} | ({"ENTER_DRY"} if include_dry else set())
     today = now_local().date()
     count = 0
 
-    try:
-        with open(JOURNAL_FILE, newline="") as f:
-            for row in csv.DictReader(f):
-                if row.get("action") not in {"ENTER", "ENTER_DRY"}:
-                    continue
+    with open(JOURNAL_FILE, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("action") not in actions:
+                continue
 
-                ts = row.get("timestamp", "")
-                try:
-                    parsed = datetime.fromisoformat(ts)
-                    # Compare in Asia/Manila so "today" matches log timestamps.
-                    if parsed.tzinfo is not None:
-                        parsed = parsed.astimezone(LOCAL_TZ)
-                    if parsed.date() == today:
-                        count += 1
-                except ValueError:
-                    continue
-    except Exception as e:
-        logging.warning(f"Could not read journal for daily trade count: {e}")
+            ts = row.get("timestamp", "")
+            try:
+                parsed = datetime.fromisoformat(ts)
+                # Compare in Asia/Manila so "today" matches log timestamps.
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(LOCAL_TZ)
+                if parsed.date() == today:
+                    count += 1
+            except ValueError:
+                continue
 
     return count
 
@@ -514,7 +619,8 @@ def is_force_close_window(clock: dict, minutes: int) -> bool:
 
 
 def build_entry_block_reasons(
-    positions: dict,
+    open_count: int,
+    exposure: float,
     account: dict,
     clock: dict,
     max_open_positions: int,
@@ -522,12 +628,14 @@ def build_entry_block_reasons(
     max_daily_trades: int,
     max_daily_loss: float,
     no_new_trades_minutes_before_close: int,
+    dry_run: bool,
 ) -> list[str]:
-    """Return reasons why new entries should be blocked. Exits are still allowed."""
+    """
+    Return reasons why new entries should be blocked. Exits are still allowed.
+    `open_count` and `exposure` (dollars) should already include pending buys.
+    """
     equity = float(account.get("equity", 0) or 0)
-    open_count = len(equity_positions(positions))
-    exposure = total_exposure_pct(positions, equity)
-    entries_today = today_entry_count()
+    exposure_pct = (exposure / equity) * 100 if equity > 0 else 100.0
     pnl = day_pnl_pct(account)
     mins_to_close = minutes_until_market_close(clock)
 
@@ -540,11 +648,18 @@ def build_entry_block_reasons(
         reasons.append(f"max open positions reached ({open_count}/{max_open_positions})")
 
     max_total_exposure_pct = max_total_exposure * 100
-    if max_total_exposure > 0 and exposure >= max_total_exposure_pct:
-        reasons.append(f"max exposure reached ({exposure:.2f}% >= {max_total_exposure_pct:.2f}%)")
+    if max_total_exposure > 0 and exposure_pct >= max_total_exposure_pct:
+        reasons.append(f"max exposure reached ({exposure_pct:.2f}% >= {max_total_exposure_pct:.2f}%)")
 
-    if max_daily_trades > 0 and entries_today >= max_daily_trades:
-        reasons.append(f"daily trade limit reached ({entries_today}/{max_daily_trades})")
+    if max_daily_trades > 0:
+        try:
+            entries_today = today_entry_count(include_dry=dry_run)
+        except Exception as e:
+            logging.warning(f"Could not read journal for daily trade count: {e}")
+            reasons.append("daily trade count unavailable (journal unreadable)")
+        else:
+            if entries_today >= max_daily_trades:
+                reasons.append(f"daily trade limit reached ({entries_today}/{max_daily_trades})")
 
     if (
         no_new_trades_minutes_before_close > 0
@@ -560,96 +675,292 @@ def build_entry_block_reasons(
 
 
 # ----- Journal -----
-EXIT_ACTIONS = {
-    "tp": ("EXIT_TP", "EXIT_TP_SUBMITTED"),
-    "sl": ("EXIT_SL", "EXIT_SL_SUBMITTED"),
-    "signal": ("EXIT_SIGNAL", "EXIT_SIGNAL_SUBMITTED"),
-    "force": ("EXIT_FORCE_CLOSE", "EXIT_FORCE_CLOSE_SUBMITTED"),
+EXIT_BASE = {
+    "tp": "EXIT_TP",
+    "sl": "EXIT_SL",
+    "signal": "EXIT_SIGNAL",
+    "force": "EXIT_FORCE_CLOSE",
 }
 
 
-def _exit_action_from_order(kind: str, order: Optional[dict]) -> tuple[str, str]:
+def journal_action(kind: str, outcome: str) -> str:
     """
-    Map a placed exit order's status to (journal_action, status_str).
-    If order is None we treat as failed-to-submit so the caller can log clearly.
+    Journal action for an order event. `kind` is "entry" or a key of EXIT_BASE.
+      entries: ENTER (submitted), ENTER_FILLED, ENTER_REJECTED, ENTER_UNCERTAIN, ENTER_CANCELED, ...
+      exits:   EXIT_TP_SUBMITTED, EXIT_TP (filled), EXIT_TP_REJECTED, EXIT_TP_UNCERTAIN, ...
     """
-    filled_action, submitted_action = EXIT_ACTIONS[kind]
-    if not order:
-        return (submitted_action, "submit_failed")
-    status = (order.get("status") or "").lower()
-    if status == "filled":
-        return (filled_action, status)
-    return (submitted_action, status or "unknown")
+    if kind == "entry":
+        return "ENTER" if outcome == "submitted" else f"ENTER_{outcome.upper()}"
+    base = EXIT_BASE[kind]
+    return base if outcome == "filled" else f"{base}_{outcome.upper()}"
 
 
 def journal_write(row: dict):
-    new_file = not JOURNAL_FILE.exists()
+    CONFIG_DIR.mkdir(exist_ok=True)
+
+    if JOURNAL_FILE.exists():
+        try:
+            with open(JOURNAL_FILE, newline="") as existing:
+                header = next(csv.reader(existing), [])
+        except OSError as e:
+            logging.warning(f"Could not inspect journal header: {e}")
+            header = []
+
+        if header and header != JOURNAL_FIELDS:
+            stamp = now_local().strftime("%Y%m%d-%H%M%S")
+            archive = JOURNAL_FILE.with_name(f"journal.v1.{stamp}.csv")
+            suffix = 1
+            while archive.exists():
+                archive = JOURNAL_FILE.with_name(f"journal.v1.{stamp}.{suffix}.csv")
+                suffix += 1
+            JOURNAL_FILE.rename(archive)
+            if header == OLD_JOURNAL_FIELDS:
+                logging.info(f"Archived old journal schema to {archive}")
+            else:
+                logging.warning(f"Archived incompatible journal schema to {archive}")
+
+    new_file = not JOURNAL_FILE.exists() or JOURNAL_FILE.stat().st_size == 0
     with open(JOURNAL_FILE, "a", newline="") as f:
-        fields = ["timestamp", "action", "symbol", "qty", "price", "reason",
-                  "rsi", "sma_fast", "sma_slow", "vol_z", "order_id", "dry_run"]
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS)
         if new_file:
             w.writeheader()
         # Fill missing keys with empty
-        w.writerow({k: row.get(k, "") for k in fields})
+        w.writerow({k: row.get(k, "") for k in JOURNAL_FIELDS})
 
 
-# ----- State (cooldowns to prevent over-trading the same name) -----
+def journal_order(rec: dict, outcome: str, order: Optional[dict] = None,
+                  note: str = "", extra: Optional[dict] = None):
+    """Write a journal row for an event on a tracked order."""
+    row = {
+        "timestamp": now_local().isoformat(timespec="seconds"),
+        "action": journal_action(rec["kind"], outcome),
+        "symbol": rec["symbol"], "qty": rec["qty"],
+        "signal_price": rec["signal_price"],
+        "fill_price": order_fill_price(order),
+        "order_status": order_status(order) or outcome,
+        "reason": rec["reason"] + (f" | {note}" if note else ""),
+        "order_id": rec.get("order_id", ""),
+        "dry_run": False,
+    }
+    row.update(extra or {})
+    journal_write(row)
+
+
+# ----- State -----
+# bot_state.json holds:
+#   cooldowns: {symbol: iso_timestamp} - no new entry in the symbol before this time
+#   orders:    {client_order_id: record} - bot orders not yet finished at the broker
+#   holdings:  {symbol: {"qty", "cost"}} - shares the bot bought and still holds
 def load_state() -> dict:
+    """Load bot state. A corrupt file raises rather than forgetting open orders and holdings."""
+    state = {}
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
-        except json.JSONDecodeError:
-            return {}
-    return {}
+            state = json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"{STATE_FILE} is not valid JSON ({e}). Fix or move it before running the bot again."
+            ) from e
+    state.setdefault("cooldowns", {})
+    state.setdefault("orders", {})
+    state.setdefault("holdings", {})
+    return state
 
 
 def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Write state atomically so a crash mid-write can't corrupt it."""
+    CONFIG_DIR.mkdir(exist_ok=True)
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_FILE)
+
+
+# ----- Order tracking -----
+def dec(value) -> Decimal:
+    return Decimal(str(value or 0))
+
+
+def _apply_fill(state: dict, symbol: str, side: str, qty: Decimal, notional: Decimal):
+    """Add bought shares to, or remove sold shares from, the bot's holdings."""
+    h = state["holdings"].get(symbol, {"qty": "0", "cost": "0"})
+    held, cost = dec(h["qty"]), dec(h["cost"])
+    if side == "buy":
+        held += qty
+        cost += notional
+    else:
+        avg = cost / held if held > 0 else Decimal(0)
+        held -= qty
+        cost -= avg * qty
+    if held > 0:
+        state["holdings"][symbol] = {"qty": str(held), "cost": str(cost)}
+    else:
+        state["holdings"].pop(symbol, None)
+
+
+def apply_order_update(state: dict, client_order_id: str, order: dict):
+    """Fold a broker snapshot of a tracked order into state: apply new fills, close out finished orders."""
+    rec = state["orders"][client_order_id]
+    rec["order_id"] = order.get("id") or rec.get("order_id", "")
+    rec["status"] = "pending"
+
+    filled = dec(order.get("filled_qty"))
+    notional = filled * dec(order.get("filled_avg_price"))
+    new_qty = filled - dec(rec["filled_qty"])
+    if new_qty > 0:
+        _apply_fill(state, rec["symbol"], rec["side"], new_qty, notional - dec(rec["filled_notional"]))
+        rec["filled_qty"], rec["filled_notional"] = str(filled), str(notional)
+
+    status = order_status(order).lower()
+    if status in TERMINAL_ORDER_STATUSES:
+        logging.info(
+            f"ORDER {status}: symbol={rec['symbol']} side={rec['side']} qty={rec['qty']} "
+            f"filled_qty={filled} order_id={rec['order_id']}"
+        )
+        journal_order(rec, status, order)
+        del state["orders"][client_order_id]
+
+
+def reconcile_orders(creds, state: dict) -> list[str]:
+    """
+    Check every order the bot is tracking with the broker and apply what happened.
+    Returns problems that must block new entries: orders that couldn't be checked,
+    or that the broker doesn't know about yet.
+    """
+    problems = []
+    for cid, rec in list(state["orders"].items()):
+        try:
+            order = get_order_by_client_id(creds, cid)
+        except requests.RequestException as e:
+            problems.append(f"{rec['symbol']} {rec['side']} order {cid} could not be checked ({e})")
+            continue
+
+        if order is not None:
+            apply_order_update(state, cid, order)
+            continue
+
+        age = now_local() - datetime.fromisoformat(rec["submitted_at"])
+        if rec["status"] != "pending" and age >= UNCERTAIN_ORDER_GRACE:
+            logging.warning(f"{rec['symbol']} order {cid} never reached the broker; forgetting it")
+            journal_order(rec, "not_found")
+            del state["orders"][cid]
+        else:
+            problems.append(f"{rec['symbol']} {rec['side']} order {cid} not found at the broker yet")
+    save_state(state)
+    return problems
+
+
+def submit_tracked_order(creds, state: dict, symbol: str, qty, side: str, kind: str,
+                         reason: str, signal_price, extra: Optional[dict] = None) -> str:
+    """
+    Submit an order and track it in state until the broker reports it finished.
+    The record is saved before sending, so a crash mid-submit is reconciled next cycle.
+    Returns "accepted", "rejected" or "uncertain".
+    """
+    cid = f"{CLIENT_ORDER_PREFIX}{uuid.uuid4().hex}"
+    rec = {
+        "symbol": symbol, "side": side, "qty": str(qty), "kind": kind,
+        "reason": reason, "signal_price": float(signal_price),
+        "status": "submitting", "order_id": "",
+        "submitted_at": now_local().isoformat(),
+        "filled_qty": "0", "filled_notional": "0",
+    }
+    state["orders"][cid] = rec
+    save_state(state)
+
+    outcome, order = place_order(creds, symbol, qty, side, cid)
+    if outcome == "rejected":
+        del state["orders"][cid]
+        journal_order(rec, "rejected", extra=extra)
+    elif outcome == "uncertain":
+        rec["status"] = "uncertain"
+        journal_order(rec, "uncertain",
+                      note="reconciling with the broker before trading this symbol again",
+                      extra=extra)
+    else:
+        rec["status"] = "pending"
+        rec["order_id"] = order.get("id", "")
+        journal_order(rec, "submitted", order, extra=extra)
+        apply_order_update(state, cid, order)
+    save_state(state)
+    return outcome
+
+
+def pending_buy_notional(state: dict) -> dict:
+    """{symbol: dollars} still reserved by the bot's unfilled buy orders."""
+    out = {}
+    for rec in state["orders"].values():
+        if rec["side"] != "buy":
+            continue
+        unfilled = dec(rec["qty"]) - dec(rec["filled_qty"])
+        if unfilled > 0:
+            out[rec["symbol"]] = out.get(rec["symbol"], 0.0) + float(unfilled) * float(rec["signal_price"])
+    return out
+
+
+def busy_sides(open_orders: list, state: dict) -> dict:
+    """{symbol: {sides}} with a working order, from the broker or the bot's own tracking."""
+    busy = {}
+    for o in open_orders:
+        busy.setdefault((o.get("symbol") or "").upper(), set()).add((o.get("side") or "").lower())
+    for rec in state["orders"].values():
+        busy.setdefault(rec["symbol"], set()).add(rec["side"])
+    return busy
+
+
+def sellable_qty(state: dict, positions: dict, symbol: str) -> Decimal:
+    """Shares the bot may sell: its own holding, capped by the long position the account has."""
+    h = state["holdings"].get(symbol)
+    pos = positions.get(symbol)
+    if not h or not pos:
+        return Decimal(0)
+    return max(min(dec(h["qty"]), dec(pos.get("qty"))), Decimal(0))
+
+
+def cooldown_until(cooldowns: dict, symbol: str) -> Optional[datetime]:
+    """When the symbol's entry cooldown ends, or None if it isn't cooling down."""
+    raw = cooldowns.get(symbol)
+    if not raw:
+        return None
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    # Compare in the same wall-clock zone we wrote them in.
+    now_cmp = now_local() if until.tzinfo else datetime.now()
+    return until if now_cmp < until else None
 
 
 # ----- Main loop -----
-def _submit_exit(creds, symbol: str, qty: int, kind: str, base_reason: str,
-                 price, dry_run: bool):
+def _submit_exit(creds, state: dict, symbol: str, qty, kind: str, base_reason: str,
+                 price, dry_run: bool, busy: dict):
     """
-    Submit an exit (sell) order and write the result to the journal.
-
-    Skips submission if there is already an open sell order for `symbol`.
-    Records EXIT_* only when the broker actually filled the order; otherwise
-    records EXIT_*_SUBMITTED with the returned status in the reason.
+    Submit an exit (sell) order for shares the bot owns, and journal it.
+    Skips submission if there is already a working sell order for `symbol`.
     """
+    sides = busy.setdefault(symbol, set())
     if dry_run:
-        filled_action, _ = EXIT_ACTIONS[kind]
         journal_write({
             "timestamp": now_local().isoformat(timespec="seconds"),
-            "action": filled_action + "_DRY", "symbol": symbol, "qty": qty,
-            "price": price, "reason": base_reason, "dry_run": True,
+            "action": journal_action(kind, "dry"), "symbol": symbol, "qty": str(qty),
+            "signal_price": price, "fill_price": "", "order_status": "dry_run",
+            "reason": base_reason, "dry_run": True,
         })
+        sides.add("sell")
         return
 
-    if has_open_order(creds, symbol, side="sell"):
+    if "sell" in sides:
         logging.info(f"SKIP exit {symbol}: open sell order already exists")
         journal_write({
             "timestamp": now_local().isoformat(timespec="seconds"),
-            "action": "EXIT_SKIPPED_OPEN_ORDER", "symbol": symbol, "qty": qty,
-            "price": price,
+            "action": "EXIT_SKIPPED_OPEN_ORDER", "symbol": symbol, "qty": str(qty),
+            "signal_price": price, "fill_price": "", "order_status": "skipped_open_order",
             "reason": f"{base_reason} | open sell order already exists",
             "dry_run": False,
         })
         return
 
-    order = place_order(creds, symbol, qty, "sell")
-    action, status = _exit_action_from_order(kind, order)
-    reason = base_reason
-    if not order or status != "filled":
-        reason = f"{base_reason} | order_status={status}"
-
-    journal_write({
-        "timestamp": now_local().isoformat(timespec="seconds"),
-        "action": action, "symbol": symbol, "qty": qty,
-        "price": price, "reason": reason,
-        "order_id": order["id"] if order else "", "dry_run": False,
-    })
+    sides.add("sell")
+    submit_tracked_order(creds, state, symbol, qty, "sell", kind, base_reason, price)
 
 
 def run_cycle(creds, watchlist: list[str], strategy_name: str,
@@ -658,10 +969,10 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
               max_total_exposure: float, max_daily_trades: int,
               max_daily_loss: float, no_new_trades_minutes_before_close: int,
               force_close_minutes_before_close: int):
-    """One full pass: check market, fetch signals, manage positions, place new entries."""
+    """One full pass: check market, reconcile orders, manage the bot's holdings, place new entries."""
     strategy = STRATEGIES[strategy_name]
     state = load_state()
-    cooldowns = state.get("cooldowns", {})  # {symbol: iso_timestamp}
+    cooldowns = state["cooldowns"]  # {symbol: iso_timestamp}
 
     is_open, clock = market_is_open(creds)
     if not is_open:
@@ -669,10 +980,20 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
         logging.info(f"Market closed. Next open: {_format_clock_ts_local(next_open)}")
         return
 
+    # Fold in what happened to orders from earlier cycles before reading positions.
+    unresolved = [] if dry_run else reconcile_orders(creds, state)
+
+    # Any failed read below raises and ends the cycle before an order is placed.
     account = get_account(creds)
     equity = float(account["equity"])
     positions = get_positions(creds)
-    logging.info(f"Equity ${equity:,.2f} | {len(positions)} open positions | strategy={strategy_name}")
+    busy = busy_sides(get_open_orders(creds), state)
+    holdings = state["holdings"]
+    logging.info(
+        f"Equity ${equity:,.2f} | {len(positions)} account positions | "
+        f"{len(holdings)} bot holdings | {len(state['orders'])} tracked orders | "
+        f"strategy={strategy_name}"
+    )
 
     force_close = is_force_close_window(clock, force_close_minutes_before_close)
     if force_close:
@@ -683,49 +1004,90 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
             f"({mins_str} <= {force_close_minutes_before_close}m to close)"
         )
 
-    # Step 1: manage existing positions — check for take-profit / stop-loss / force-close
-    for symbol, pos in positions.items():
-        # Skip option positions — bot trades equities only here
-        if not is_equity_symbol(symbol):
+    # Step 1: manage the bot's own holdings - take-profit / stop-loss / force-close
+    for symbol, h in list(holdings.items()):
+        owned = dec(h["qty"])
+        avg = dec(h["cost"]) / owned
+        pos = positions.get(symbol)
+        broker_qty = dec(pos.get("qty")) if pos else Decimal(0)
+
+        if broker_qty <= 0:
+            if busy.get(symbol):
+                continue  # an order is still working; reconcile next cycle
+            logging.warning(
+                f"{symbol}: bot records {owned} shares but the account holds {broker_qty}; "
+                f"dropping the record"
+            )
+            if not dry_run:
+                journal_write({
+                    "timestamp": now_local().isoformat(timespec="seconds"),
+                    "action": "HOLDING_DROPPED", "symbol": symbol, "qty": str(owned),
+                    "reason": f"account holds {broker_qty}", "dry_run": False,
+                })
+                del holdings[symbol]
             continue
-        pnl_pct = float(pos["unrealized_plpc"]) * 100
-        qty = abs(int(float(pos["qty"])))
-        price = pos.get("current_price", 0)
+
+        if broker_qty < owned:
+            logging.warning(
+                f"{symbol}: bot records {owned} shares but the account holds {broker_qty}; "
+                f"managing {broker_qty}"
+            )
+            if not dry_run:
+                holdings[symbol] = {"qty": str(broker_qty), "cost": str(avg * broker_qty)}
+        qty = min(owned, broker_qty)
+
+        price = dec(pos.get("current_price"))
+        if avg <= 0 or price <= 0:
+            logging.warning(f"{symbol}: no usable entry or current price, skipping exit checks")
+            continue
+        pnl_pct = float((price - avg) / avg * 100)
 
         if force_close:
+            kind = "force"
             reason = (
                 f"force close window ({pnl_pct:+.2f}% pnl, "
                 f"<= {force_close_minutes_before_close}m to close)"
             )
-            logging.info(f"EXIT {symbol}: {reason}")
-            _submit_exit(creds, symbol, qty, "force", reason, price, dry_run)
         elif pnl_pct >= take_profit_pct:
+            kind = "tp"
             reason = f"take-profit hit ({pnl_pct:+.2f}% >= {take_profit_pct}%)"
-            logging.info(f"EXIT {symbol}: {reason}")
-            _submit_exit(creds, symbol, qty, "tp", reason, price, dry_run)
         elif pnl_pct <= -stop_loss_pct:
+            kind = "sl"
             reason = f"stop-loss hit ({pnl_pct:+.2f}% <= -{stop_loss_pct}%)"
-            logging.info(f"EXIT {symbol}: {reason}")
-            _submit_exit(creds, symbol, qty, "sl", reason, price, dry_run)
+        else:
+            continue
+        logging.info(f"EXIT {symbol}: {reason}")
+        _submit_exit(creds, state, symbol, qty, kind, reason, float(price), dry_run, busy)
 
     # Re-fetch positions in case we just exited
     if not dry_run:
+        save_state(state)
         positions = get_positions(creds)
 
-    entry_block_reasons = build_entry_block_reasons(
-        positions, account, clock,
-        max_open_positions, max_total_exposure, max_daily_trades,
-        max_daily_loss, no_new_trades_minutes_before_close,
-    )
+    dry_planned = {}  # {symbol: dollars} of dry-run entries made this cycle
 
-    if force_close:
-        entry_block_reasons = list(entry_block_reasons) + ["force close window active"]
+    def current_usage() -> tuple[int, float]:
+        return entry_usage(positions, {**pending_buy_notional(state), **dry_planned})
 
+    def current_block_reasons() -> list[str]:
+        open_count, exposure = current_usage()
+        reasons = build_entry_block_reasons(
+            open_count, exposure, account, clock,
+            max_open_positions, max_total_exposure, max_daily_trades,
+            max_daily_loss, no_new_trades_minutes_before_close, dry_run,
+        )
+        if force_close:
+            reasons.append("force close window active")
+        if unresolved:
+            reasons.append("unresolved orders: " + "; ".join(unresolved))
+        return reasons
+
+    entry_block_reasons = current_block_reasons()
     if entry_block_reasons:
         logging.info("New entries blocked: " + "; ".join(entry_block_reasons))
 
-    # Step 2: scan watchlist for entry signals
-    table = Table(title=f"Signals — {strategy_name}", box=box.SIMPLE_HEAD, header_style="bold cyan")
+    # Step 2: scan watchlist for signals
+    table = Table(title=f"Signals - {strategy_name}", box=box.ASCII, header_style="bold cyan")
     table.add_column("Symbol", style="bold")
     table.add_column("Price", justify="right")
     table.add_column("Action")
@@ -736,44 +1098,36 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
         if not symbol:
             continue
 
-        # Cooldown: don't re-enter the same name within an hour
-        cooldown_until = cooldowns.get(symbol)
-        if cooldown_until:
-            try:
-                until = datetime.fromisoformat(cooldown_until)
-                # Compare in the same wall-clock zone we wrote them in.
-                now_cmp = now_local() if until.tzinfo else datetime.now()
-                if now_cmp < until:
-                    table.add_row(symbol, "—", "[dim]cooldown[/dim]",
-                                  f"until {until.strftime('%H:%M')}")
-                    continue
-            except ValueError:
-                pass
-
         bars = fetch_bars(creds, symbol)
         if not bars:
-            table.add_row(symbol, "—", "[dim]no data[/dim]", "bars unavailable")
+            table.add_row(symbol, "-", "[dim]no data[/dim]", "no recent bars")
             continue
 
         sig = strategy(symbol, bars)
 
         display_action = sig.action.upper()
         display_reason = sig.reason
+        is_entry = sig.action == "buy" and symbol not in positions and symbol not in holdings
         blocked_for_symbol = []
 
-        if sig.action == "buy" and symbol not in positions and entry_block_reasons:
-            blocked_for_symbol = entry_block_reasons
-            display_action = "BLOCKED"
-            display_reason = f"{sig.reason} | blocked: {'; '.join(blocked_for_symbol)}"
+        if is_entry:
+            # Cooldown: don't re-enter the same name within an hour. Exits are not affected.
+            until = cooldown_until(cooldowns, symbol)
+            if until:
+                blocked_for_symbol.append(f"cooldown until {until.strftime('%H:%M')}")
+            blocked_for_symbol += entry_block_reasons
+            if blocked_for_symbol:
+                display_action = "BLOCKED"
+                display_reason = f"{sig.reason} | blocked: {'; '.join(blocked_for_symbol)}"
 
         action_color = {"BUY": "green", "SELL": "red", "HOLD": "dim", "BLOCKED": "yellow"}[display_action]
         table.add_row(symbol, f"${sig.price:.2f}",
                       f"[{action_color}]{display_action}[/{action_color}]", display_reason)
 
-        # Only enter on BUY signals; exits are managed via TP/SL above.
-        if sig.action == "buy" and symbol not in positions:
+        # Enter on BUY signals; exit the bot's own holdings on SELL signals.
+        if is_entry:
             if blocked_for_symbol:
-                logging.info(f"SKIP {symbol}: entry blocked — {'; '.join(blocked_for_symbol)}")
+                logging.info(f"SKIP {symbol}: entry blocked - {'; '.join(blocked_for_symbol)}")
                 continue
 
             qty = position_size(account, sig.price, max_per_trade=max_per_trade)
@@ -781,62 +1135,66 @@ def run_cycle(creds, watchlist: list[str], strategy_name: str,
                 logging.warning(f"{symbol}: sizing returned 0 qty, skipping")
                 continue
 
-            # Avoid submitting a buy when there is already an open order for this symbol.
-            if not dry_run and has_open_order(creds, symbol):
+            # Check the cap with this order included, not just what is held already.
+            _, exposure = current_usage()
+            after_pct = (exposure + qty * sig.price) / equity * 100 if equity > 0 else 100.0
+            if max_total_exposure > 0 and after_pct > max_total_exposure * 100:
+                logging.info(
+                    f"SKIP {symbol}: order would take exposure to {after_pct:.2f}% "
+                    f"(> {max_total_exposure * 100:.2f}%)"
+                )
+                continue
+
+            indicators = {"rsi": sig.rsi_val, "sma_fast": sig.sma_fast,
+                          "sma_slow": sig.sma_slow, "vol_z": sig.vol_z}
+
+            # Avoid submitting a buy when there is already a working order for this symbol.
+            if busy.get(symbol):
                 logging.info(f"SKIP {symbol}: open order already exists for symbol")
                 journal_write({
                     "timestamp": now_local().isoformat(timespec="seconds"),
                     "action": "ENTER_SKIPPED_OPEN_ORDER", "symbol": symbol, "qty": qty,
-                    "price": sig.price,
+                    "signal_price": sig.price,
+                    "fill_price": "", "order_status": "skipped_open_order",
                     "reason": f"{sig.reason} | open order already exists",
-                    "rsi": sig.rsi_val, "sma_fast": sig.sma_fast, "sma_slow": sig.sma_slow,
-                    "vol_z": sig.vol_z, "dry_run": False,
+                    **indicators, "dry_run": dry_run,
                 })
                 continue
 
-            logging.info(f"ENTER {symbol}: BUY {qty} @ ~${sig.price:.2f} — {sig.reason}")
-            row = {
-                "timestamp": now_local().isoformat(timespec="seconds"),
-                "action": "ENTER" if not dry_run else "ENTER_DRY",
-                "symbol": symbol, "qty": qty, "price": sig.price, "reason": sig.reason,
-                "rsi": sig.rsi_val, "sma_fast": sig.sma_fast, "sma_slow": sig.sma_slow,
-                "vol_z": sig.vol_z, "dry_run": dry_run,
-            }
+            logging.info(f"ENTER {symbol}: BUY {qty} @ ~${sig.price:.2f} - {sig.reason}")
+            if dry_run:
+                journal_write({
+                    "timestamp": now_local().isoformat(timespec="seconds"),
+                    "action": "ENTER_DRY", "symbol": symbol, "qty": qty,
+                    "signal_price": sig.price, "fill_price": "", "order_status": "dry_run",
+                    "reason": sig.reason, **indicators, "dry_run": True,
+                })
+                dry_planned[symbol] = qty * sig.price
+            else:
+                outcome = submit_tracked_order(creds, state, symbol, qty, "buy", "entry",
+                                               sig.reason, sig.price, extra=indicators)
+                if outcome != "rejected":
+                    cooldowns[symbol] = (now_local() + timedelta(hours=1)).isoformat()
+            busy.setdefault(symbol, set()).add("buy")
 
-            if not dry_run:
-                order = place_order(creds, symbol, qty, "buy")
-                row["order_id"] = order["id"] if order else ""
-                cooldowns[symbol] = (now_local() + timedelta(hours=1)).isoformat()
-
-            journal_write(row)
-
-            # Update local state so later symbols in the same cycle respect exposure/position/trade caps.
-            positions[symbol] = {
-                "symbol": symbol,
-                "qty": str(qty),
-                "market_value": str(qty * sig.price),
-            }
-            entry_block_reasons = build_entry_block_reasons(
-                positions, account, clock,
-                max_open_positions, max_total_exposure, max_daily_trades,
-                max_daily_loss, no_new_trades_minutes_before_close,
-            )
-            if force_close:
-                entry_block_reasons = list(entry_block_reasons) + ["force close window active"]
-        elif sig.action == "sell" and symbol in positions:
-            qty = abs(int(float(positions[symbol]["qty"])))
+            # Later symbols in the same cycle must respect the caps with this entry counted.
+            entry_block_reasons = current_block_reasons()
+        elif sig.action == "sell" and symbol in holdings and not busy.get(symbol):
+            qty = sellable_qty(state, positions, symbol)
+            if qty <= 0:
+                continue
             logging.info(f"EXIT {symbol}: signal sell")
-            _submit_exit(creds, symbol, qty, "signal", sig.reason, sig.price, dry_run)
+            _submit_exit(creds, state, symbol, qty, "signal", sig.reason, sig.price, dry_run, busy)
 
     console.print(table)
-    state["cooldowns"] = cooldowns
-    save_state(state)
+    if not dry_run:
+        save_state(state)
 
 
 def main():
     p = argparse.ArgumentParser(
         prog="edgetrader-bot",
-        description="Scheduled paper trading bot — rule-based signals, risk-managed",
+        description="Scheduled paper trading bot - rule-based signals, risk-managed",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -885,7 +1243,7 @@ Examples:
     setup_logging(args.verbose)
 
     if args.env == "live" and not args.dry_run:
-        console.print("[bold red]⚠ LIVE TRADING MODE — real money[/bold red]")
+        console.print("[bold red]LIVE TRADING MODE - real money[/bold red]")
         confirm = input("Type 'I UNDERSTAND' to proceed: ")
         if confirm != "I UNDERSTAND":
             console.print("Aborted.")
@@ -895,7 +1253,7 @@ Examples:
     watchlist = [s.strip().upper() for s in args.watchlist.split(",") if s.strip()]
 
     mode = "DRY RUN" if args.dry_run else f"LIVE-{args.env.upper()}"
-    console.print(f"[bold green]⬡ EdgeTrader Bot[/bold green] — {mode} | "
+    console.print(f"[bold green]EdgeTrader Bot[/bold green] - {mode} | "
                   f"strategy={args.strategy} | watchlist={','.join(watchlist)}")
     console.print(f"[dim]Logs: {LOG_FILE}  Journal: {JOURNAL_FILE}[/dim]\n")
 
@@ -915,7 +1273,7 @@ Examples:
     cycle = 0
     while True:
         cycle += 1
-        console.print(f"\n[dim]── Cycle {cycle} @ {now_local().strftime('%Y-%m-%d %H:%M:%S %Z')} ──[/dim]")
+        console.print(f"\n[dim]-- Cycle {cycle} @ {now_local().strftime('%Y-%m-%d %H:%M:%S %Z')} --[/dim]")
 
         try:
             is_open, clock = market_is_open(creds)
