@@ -371,6 +371,10 @@ def cmd_chain(args):
             "strike": strike_val, "expiry": expiry, "snap": snap
         })
 
+    if not contracts:
+        console.print(f"[yellow]No option contracts found for {sym}.[/yellow]")
+        return
+
     # Filter by expiry if not given — pick nearest
     expiries = sorted(set(c["expiry"] for c in contracts))
     if not args.expiry and expiries:
@@ -561,10 +565,17 @@ def cmd_close(args):
     creds = get_credentials(args.env)
 
     if args.all:
-        if not Confirm.ask(f"[red]Close ALL positions on {creds['env'].upper()}?[/red]", default=False):
+        if not args.yes and not Confirm.ask(f"[red]Close ALL positions on {creds['env'].upper()}?[/red]", default=False):
             return
         r = requests.delete(f"{base_url(creds['env'])}/v2/positions", headers=headers(creds), timeout=15)
-        console.print(f"[green]✓ Close-all submitted[/green] — {len(r.json())} orders placed")
+        if r.status_code not in (200, 207):
+            console.print(f"[red]Error:[/red] {r.text}")
+            return
+        results = r.json()
+        failed = [x for x in results if x.get("status") not in (200, 201)]
+        console.print(f"[green]✓ Close-all submitted[/green] — {len(results) - len(failed)} orders placed")
+        for x in failed:
+            console.print(f"[red]✗ {x.get('symbol', '?')}:[/red] {x.get('body')}")
         return
 
     sym = args.symbol.upper()
@@ -595,7 +606,14 @@ def cmd_cancel(args):
         if not Confirm.ask("Cancel ALL open orders?", default=False):
             return
         r = requests.delete(f"{base_url(creds['env'])}/v2/orders", headers=headers(creds), timeout=15)
-        console.print(f"[green]✓ Cancelled all[/green]")
+        if r.status_code not in (200, 207):
+            console.print(f"[red]Error:[/red] {r.text}")
+            return
+        results = r.json()
+        failed = [x for x in results if x.get("status") not in (200, 204)]
+        console.print(f"[green]✓ Cancel requested[/green] for {len(results) - len(failed)} orders")
+        for x in failed:
+            console.print(f"[red]✗ {x.get('id', '?')}:[/red] {x.get('body')}")
         return
     r = requests.delete(
         f"{base_url(creds['env'])}/v2/orders/{args.order_id}",
